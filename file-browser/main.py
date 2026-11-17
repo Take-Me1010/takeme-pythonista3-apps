@@ -19,7 +19,8 @@ import queue
 import ctypes
 import ui
 import console
-from objc_util import ObjCClass, ObjCInstance, create_objc_class, on_main_thread, ns
+from objc_util import (ObjCClass, ObjCInstance, create_objc_class, on_main_thread, ns,
+                       c, CGSize, CGRect, CGPoint)
 
 NAV = None
 _keep_alive = []      # デリゲート等がGCされないよう保持
@@ -65,22 +66,35 @@ def is_image(name):
     return os.path.splitext(name)[1].lower() in IMAGE_EXTS
 
 
+UIImage = ObjCClass('UIImage')
+UIBezierPath = ObjCClass('UIBezierPath')
+c.UIGraphicsBeginImageContextWithOptions.argtypes = [CGSize, ctypes.c_bool, ctypes.c_double]
+c.UIGraphicsBeginImageContextWithOptions.restype = None
+c.UIGraphicsGetImageFromCurrentImageContext.restype = ctypes.c_void_p
+c.UIGraphicsEndImageContext.restype = None
+
+
+@on_main_thread
 def make_thumb(path):
-    with open(path, 'rb') as f:
-        data = f.read()
-    img = ui.Image.from_data(data)
-    if img is None:
+    src = UIImage.imageWithContentsOfFile_(path)
+    if not src:
         return None
-    w, h = img.size
+    sz = src.size()
+    w, h = sz.width, sz.height
     if not w or not h:
         return None
     # 正方形に中央トリミング（アスペクトフィル）
     s = max(THUMB / w, THUMB / h)
     dw, dh = w * s, h * s
-    with ui.ImageContext(THUMB, THUMB) as ctx:
-        ui.Path.rounded_rect(0, 0, THUMB, THUMB, 6).add_clip()
-        img.draw((THUMB - dw) / 2, (THUMB - dh) / 2, dw, dh)
-        return ctx.get_image()
+    box = CGRect(CGPoint(0, 0), CGSize(THUMB, THUMB))
+    c.UIGraphicsBeginImageContextWithOptions(CGSize(THUMB, THUMB), False, 0.0)
+    try:
+        UIBezierPath.bezierPathWithRoundedRect_cornerRadius_(box, 6).addClip()
+        src.drawInRect_(CGRect(CGPoint((THUMB - dw) / 2, (THUMB - dh) / 2),
+                               CGSize(dw, dh)))
+        return ObjCInstance(c.UIGraphicsGetImageFromCurrentImageContext())
+    finally:
+        c.UIGraphicsEndImageContext()
 
 
 @on_main_thread
@@ -202,7 +216,7 @@ class DirSource(object):
             else:
                 cell.text_label.text = '📄 ' + e['name']
             if thumb:
-                cell.image_view.image = thumb
+                ObjCInstance(cell.image_view).setImage_(thumb)
             cell.detail_text_label.text = fmt_size(e['size']) + '  ・  ' + fmt_time(e['mtime'])
         return cell
 
