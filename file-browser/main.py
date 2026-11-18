@@ -10,7 +10,8 @@
 #   プレイヤーは下から出るシート（半分 / 全画面、下スワイプで閉じる）で、
 #   閉じても画面下のミニプレイヤーに残り、タップで再び引き出せます
 # ・ファイル／フォルダを長押しすると操作メニューが出て、削除できます（確認あり・元に戻せません）
-# ・音声プレイヤー部分は music_player.py に分けています（同じフォルダに置いてください）
+# ・音声プレイヤー部分は music_player.py、長押しメニューは action_sheet.py に
+#   分けています（同じフォルダに置いてください）
 
 import os
 import shutil
@@ -24,6 +25,7 @@ from objc_util import (ObjCClass, ObjCInstance, create_objc_class, on_main_threa
                        ns, sel, c, CGSize, CGRect, CGPoint)
 
 import music_player as music
+import action_sheet as sheet
 
 NAV = None
 _keep_alive = []      # デリゲート等がGCされないよう保持
@@ -300,7 +302,6 @@ def push_view(view):
 # ---------- 長押しメニュー（ファイル操作） ----------
 UITableView = ObjCClass('UITableView')
 UILongPressGestureRecognizer = ObjCClass('UILongPressGestureRecognizer')
-ACTION_DEFAULT, ACTION_CANCEL, ACTION_DESTRUCTIVE = 0, 1, 2
 _long_press_handlers = {}   # ジェスチャーのアドレス -> Python の関数
 
 
@@ -354,111 +355,13 @@ def attach_long_press(tv, callback):
     _long_press_handlers[_addr(gr.ptr)] = on_press
 
 
-# --- アクションシート風メニュー ---
-# UIAlertController は使わない。UIAlertAction のハンドラ（ObjCBlock）を UIKit が
-# 呼ぶときに解放済みのメモリを触ってクラッシュするため（knowledge/bugs.md 参照）。
-# ボタンの処理が Python だけで完結するよう、Pythonista の ui で作る。
-SHEET_ROW = 56          # ボタン1行の高さ
-SHEET_HEAD = 64         # タイトル部分の高さ
-SAFE_BOTTOM = 34        # ホームインジケータ分の余白
-_open_sheet = None
-
-
-class ActionSheet(ui.View):
-    def __init__(self, title, message, actions):
-        """actions: [(ボタン名, ACTION_*, 押したときの関数 or None), ...]"""
-        self.flex = 'WH'
-        self.background_color = (0, 0, 0, 0)
-        self._shown = False
-        self._closing = False
-        # 背景をタップしたら閉じる
-        self.dim = ui.Button(action=lambda s: self.close())
-        self.dim.flex = 'WH'
-        self.add_subview(self.dim)
-
-        self.card = ui.View(background_color='white', corner_radius=14)
-        self.cancel_card = ui.View(background_color='white', corner_radius=14)
-        self.title_label = ui.Label(text=title, font=('<system-bold>', 14),
-                                    text_color='#8e8e93', alignment=ui.ALIGN_CENTER)
-        self.msg_label = ui.Label(text=message, font=('<system>', 12),
-                                  text_color='#8e8e93', alignment=ui.ALIGN_CENTER)
-        self.card.add_subview(self.title_label)
-        self.card.add_subview(self.msg_label)
-
-        self.rows = []
-        for label, kind, fn in actions:
-            cancel = kind == ACTION_CANCEL
-            b = ui.Button(title=label,
-                          font=('<system-bold>' if cancel else '<system>', 19),
-                          tint_color='#ff3b30' if kind == ACTION_DESTRUCTIVE else '#007aff',
-                          action=(lambda fn: lambda s: self.close(fn))(fn))
-            line = ui.View(background_color='#d1d1d6')
-            parent = self.cancel_card if cancel else self.card
-            parent.add_subview(line)
-            parent.add_subview(b)
-            self.rows.append((cancel, b, line))
-        self.has_cancel = any(r[0] for r in self.rows)
-        self.add_subview(self.card)
-        self.add_subview(self.cancel_card)
-
-    def layout(self):
-        w, h = self.width, self.height
-        m = 8
-        cw = w - 2 * m
-        self.title_label.frame = (16, 12, cw - 32, 22)
-        self.msg_label.frame = (16, 34, cw - 32, 18)
-        y = SHEET_HEAD
-        for cancel, b, line in self.rows:
-            if cancel:
-                line.hidden = True
-                b.frame = (0, 0, cw, SHEET_ROW)
-            else:
-                line.frame = (0, y, cw, 0.5)
-                b.frame = (0, y, cw, SHEET_ROW)
-                y += SHEET_ROW
-        extra = (m + SHEET_ROW) if self.has_cancel else 0
-        top = (h - y - extra - SAFE_BOTTOM) if self._shown else h   # 閉じているときは画面外
-        self.card.frame = (m, top, cw, y)
-        self.cancel_card.frame = (m, top + y + m, cw, SHEET_ROW)
-        self.cancel_card.hidden = not self.has_cancel
-        self.background_color = (0, 0, 0, 0.3 if self._shown else 0)
-
-    def show(self, parent):
-        self.frame = parent.bounds
-        parent.add_subview(self)
-        self.layout()
-        self._shown = True
-        ui.animate(self.layout, 0.25)
-
-    def close(self, then=None):
-        if self._closing:
-            return
-        self._closing = True
-        self._shown = False
-
-        def done():
-            global _open_sheet
-            if self.superview:
-                self.superview.remove_subview(self)
-            if _open_sheet is self:
-                _open_sheet = None
-            if then:
-                then()
-        ui.animate(self.layout, 0.2, completion=done)
-
-
-@on_main_thread
 def show_item_menu(e, on_changed):
-    global _open_sheet
-    if _open_sheet is not None:
-        return
     kind = 'フォルダ' if e['isdir'] else fmt_size(e['size'])
-    _open_sheet = ActionSheet(e['name'], kind + '  ・  ' + fmt_time(e['mtime']), [
-        ('削除', ACTION_DESTRUCTIVE, lambda: confirm_delete(e, on_changed)),
+    sheet.show(NAV, e['name'], kind + '  ・  ' + fmt_time(e['mtime']), [
+        ('削除', sheet.ACTION_DESTRUCTIVE, lambda: confirm_delete(e, on_changed)),
         # 他の操作（名前の変更・共有など）はここに足していけます
-        ('キャンセル', ACTION_CANCEL, None),
+        ('キャンセル', sheet.ACTION_CANCEL, None),
     ])
-    _open_sheet.show(NAV)
 
 
 def confirm_delete(e, on_changed):
@@ -476,6 +379,7 @@ def confirm_delete(e, on_changed):
             return
         delete_entry(e, on_changed)
     threading.Thread(target=ask, daemon=True).start()
+
 
 def delete_entry(e, on_changed):
     path = e['path']
