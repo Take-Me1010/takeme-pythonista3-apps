@@ -67,3 +67,39 @@ _thumb_queue.put((key, tv))    # また A が返る → A = (A, tv)
   - `"triggered": true` が付いたスレッドの `frames` を見る
   - `imageIndex` は `usedImages` の何番目かを指す
   - メモリ不足で落ちた場合は `.ips` ではなく `JetsamEvent-*.ips` が出る
+
+## UIAlertAction のハンドラ（ObjCBlock）でクラッシュする
+
+- 発生: `file-browser/main.py` の長押しメニュー、Pythonista 3.4 / iOS 27.2.1
+- 症状: 削除の確認ダイアログを出した後、ボタンを押すとトレースバックなしで落ちる
+
+### クラッシュレポート（.ips）の特徴
+
+```
+"type" : "EXC_BAD_ACCESS", "signal" : "SIGSEGV"   KERN_INVALID_ADDRESS at 0x0
+objc_msgSend  (x1 = "retain")
+-[UIAlertController _invokeHandlersForAction:]
+__103-[UIAlertController _dismissAnimated:triggeringAction:...]_block_invoke_2
+```
+
+- メインスレッドで、アラートが閉じるアニメーションの完了後にハンドラを呼ぶところで落ちている
+- `retain` しようとしたオブジェクト（x0）のアドレスが、メインスレッドのスタックの使用済み領域（sp より下）を指していた
+
+### 原因（推定）
+
+`objc_util.ObjCBlock` で作ったブロックを `UIAlertAction.actionWithTitle_style_handler_` に渡すと、
+UIKit は後で使うためにブロックを保持する。ブロックを呼ぶときに、すでに解放されたスタック上のデータを
+参照して落ちていると考えられる。
+Python 側で `ObjCBlock` を保持していても防げなかった。1回目のメニューは動くこともあり、運次第で落ちる。
+
+### 対処
+
+UIKit が後から呼ぶブロックを渡さない。
+
+- メニュー（アクションシート）は Pythonista の `ui.View` / `ui.Button` で自作する
+- 確認ダイアログは `console.alert` を使う（メインスレッド以外から呼ぶ。キャンセルは `KeyboardInterrupt`）
+
+### 教訓
+
+- `ObjCBlock` を、UIKit が保持して後から呼ぶハンドラ（`UIAlertAction` など）に渡すのは避ける
+- .ips に `_invokeHandlersForAction:` や `objc_msgSend` + `retain` が出ていて、アドレスがスタック領域なら、ブロックの寿命を疑う

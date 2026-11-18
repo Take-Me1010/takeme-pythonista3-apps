@@ -9,18 +9,23 @@
 #   ループ再生（なし / 全曲 / 1曲）・シャッフル再生ができます
 #   プレイヤーは下から出るシート（半分 / 全画面、下スワイプで閉じる）で、
 #   閉じても画面下のミニプレイヤーに残り、タップで再び引き出せます
-# ・音声プレイヤー部分は music_player.py に分けています（同じフォルダに置いてください）
+# ・ファイル／フォルダを長押しすると操作メニューが出て、削除できます（確認あり・元に戻せません）
+# ・音声プレイヤー部分は music_player.py、長押しメニューは action_sheet.py に
+#   分けています（同じフォルダに置いてください）
 
 import os
+import shutil
 import datetime
 import threading
 import queue
 import ctypes
 import ui
-from objc_util import (ObjCClass, ObjCInstance, create_objc_class, on_main_thread, ns,
-                       c, CGSize, CGRect, CGPoint)
+import console
+from objc_util import (ObjCClass, ObjCInstance, create_objc_class, on_main_thread,
+                       ns, sel, c, CGSize, CGRect, CGPoint)
 
 import music_player as music
+import action_sheet as sheet
 
 NAV = None
 _keep_alive = []      # デリゲート等がGCされないよう保持
@@ -294,6 +299,115 @@ def push_view(view):
     music.bring_mini_to_front()
 
 
+# ---------- 長押しメニュー（ファイル操作） ----------
+UITableView = ObjCClass('UITableView')
+UILongPressGestureRecognizer = ObjCClass('UILongPressGestureRecognizer')
+_long_press_handlers = {}   # ジェスチャーのアドレス -> Python の関数
+
+
+def _addr(p):
+    return p if isinstance(p, int) else ctypes.cast(p, ctypes.c_void_p).value
+
+
+def handleLongPress_(_self, _cmd, _gr):
+    gr = ObjCInstance(_gr)
+    if gr.state() != 1:     # UIGestureRecognizerStateBegan のときだけ（指を離すまで1回）
+        return
+    fn = _long_press_handlers.get(_addr(_gr))
+    if fn:
+        fn(gr)
+handleLongPress_.restype = None
+handleLongPress_.argtypes = [ctypes.c_void_p]
+
+
+LongPressTarget = create_objc_class('PyLongPressTarget', methods=[handleLongPress_])
+
+
+def find_table_view(v):
+    # ui.TableView の中にある本物の UITableView を探す
+    if v.isKindOfClass_(UITableView):
+        return v
+    for sub in v.subviews():
+        found = find_table_view(sub)
+        if found:
+            return found
+    return None
+
+
+@on_main_thread
+def attach_long_press(tv, callback):
+    """tv（ui.TableView）を長押ししたら callback(table, index_path) を呼ぶ"""
+    table = find_table_view(ObjCInstance(tv))
+    if table is None:
+        return
+
+    def on_press(gr):
+        ip = table.indexPathForRowAtPoint_(gr.locationInView_(table))
+        if ip is not None:
+            callback(table, ip)
+
+    target = LongPressTarget.new()
+    gr = UILongPressGestureRecognizer.alloc().initWithTarget_action_(
+        target, sel('handleLongPress:'))
+    gr.setMinimumPressDuration_(0.5)
+    table.addGestureRecognizer_(gr)
+    _keep_alive.extend([target, gr])
+    _long_press_handlers[_addr(gr.ptr)] = on_press
+
+
+def show_item_menu(e, on_changed):
+    kind = 'フォルダ' if e['isdir'] else fmt_size(e['size'])
+    sheet.show(NAV, e['name'], kind + '  ・  ' + fmt_time(e['mtime']), [
+        ('削除', sheet.ACTION_DESTRUCTIVE, lambda: confirm_delete(e, on_changed)),
+        # 他の操作（名前の変更・共有など）はここに足していけます
+        ('キャンセル', sheet.ACTION_CANCEL, None),
+    ])
+
+
+def confirm_delete(e, on_changed):
+    def ask():
+        # console.alert は Pythonista 純正の確認ダイアログ。メインスレッド以外から呼ぶ
+        if e['isdir']:
+            n = count_items(e['path'])
+            msg = ('フォルダ内の %d 項目もすべて削除されます。' % n) if n else ''
+        else:
+            msg = ''
+        msg += 'この操作は取り消せません。'
+        try:
+            console.alert('「%s」を削除しますか？' % e['name'], msg, '削除')
+        except KeyboardInterrupt:       # キャンセル
+            return
+        delete_entry(e, on_changed)
+    threading.Thread(target=ask, daemon=True).start()
+
+
+def delete_entry(e, on_changed):
+    path = e['path']
+
+    def work():
+        # 大きなフォルダでも画面が固まらないよう、削除は裏のスレッドで行う
+        err = None
+        try:
+            if e['isdir'] and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except Exception as ex:
+            err = str(ex)
+        finish(err)
+
+    @on_main_thread
+    def finish(err):
+        music.forget_paths([path])      # 再生中のプレイリストからも外す
+        on_changed()
+        if err:
+            console.hud_alert('削除できません: ' + err, 'error', 2.0)
+        else:
+            console.hud_alert('削除しました', 'success', 0.8)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 # ---------- フォルダ画面 ----------
 def make_dir_view(path):
     tv = ui.TableView()
@@ -317,6 +431,14 @@ def make_dir_view(path):
         ui.ButtonItem(title='隠し:非表示', action=toggle_hidden),
         ui.ButtonItem(title='♪', action=music.open_player),
     ]
+
+    def on_long_press(table, ip):
+        row = ip.row()
+        if src.error or row >= len(src.entries):   # 空フォルダ表示や末尾の空行は対象外
+            return
+        show_item_menu(src.entries[row], lambda: do_reload(None))
+
+    attach_long_press(tv, on_long_press)
     return tv
 
 

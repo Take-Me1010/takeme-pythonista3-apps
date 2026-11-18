@@ -12,6 +12,7 @@
 #   open_player(sender=None)  プレイヤーのシートを開く（ButtonItem の action にも使える）
 #   attach_mini_player(nav)   NavigationView にミニプレイヤーを付け、終了時の停止を仕込む
 #   bring_mini_to_front()     画面遷移後にミニプレイヤーを手前に出す
+#   forget_paths(paths)       削除したファイルをプレイリストから外す
 
 import os
 import time
@@ -494,6 +495,50 @@ def play_files(paths, index):
     if MINI is not None:
         MINI.update()
     open_player()
+
+
+@on_main_thread
+def forget_paths(removed):
+    """削除したファイル（フォルダならその中身も）をプレイリストから外す"""
+    removed = set(removed)
+    prefixes = tuple(r.rstrip('/') + '/' for r in removed)
+
+    def gone(p):
+        return p in removed or p.startswith(prefixes)
+
+    P = PLAYER
+    if not any(gone(p) for p in P.paths):
+        return
+    cur = P.current_index()
+    cur_gone = cur is not None and gone(P.paths[cur])
+    was_playing = P.is_playing()
+
+    # 残る曲だけで paths を作り直し、再生順（order）もそのまま詰める
+    remap, paths = {}, []
+    for i, p in enumerate(P.paths):
+        if not gone(p):
+            remap[i] = len(paths)
+            paths.append(p)
+    order = [remap[i] for i in P.order if i in remap]
+    if cur_gone:
+        # 今の曲が消えたら、次に流れるはずだった曲の位置へ
+        pos = sum(1 for i in P.order[:P.pos] if i in remap)
+        pos = pos if pos < len(order) else 0
+    else:
+        pos = order.index(remap[cur]) if cur is not None else 0
+
+    if cur_gone:
+        P._stop_av()
+    P.paths, P.order, P.pos = paths, order, pos
+    if not paths:
+        close_player()
+    elif cur_gone and was_playing:
+        P.play_current()
+
+    if MINI is not None:
+        MINI.update()
+    if sheet_is_open():
+        _player_view.update()
 
 
 def attach_mini_player(nav):
